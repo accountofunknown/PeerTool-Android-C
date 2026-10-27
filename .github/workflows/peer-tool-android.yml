@@ -29,7 +29,7 @@ env:
   EXTRACT_DIR: peertool-src
   EXPECTED_PROJECT_DIR: PeerTool
   GRADLE_VERSION: "9.6.0"
-  ANDROID_PLATFORM: "android-36"
+  ANDROID_PLATFORM: "android-37"
   ANDROID_BUILD_TOOLS: "36.0.0"
   APPLICATION_ID: creator.peer.tool
 
@@ -108,7 +108,14 @@ jobs:
             exit 1
           fi
           yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" "platform-tools"
+          # compileSdk 37 is required by androidx.core 1.19 / Compose 1.12. Package naming differs between SDK
+          # releases (android-37 vs android-37.0), so discover what this sdkmanager offers.
+          "$SDKMANAGER" --list 2>/dev/null | awk '{print $1}' | grep -xE 'platforms;android-37(\.0)?' | sort -u > /tmp/platforms37.txt || true
+          echo "Matching platform packages:"; cat /tmp/platforms37.txt || true
+          PKGS=("build-tools;${ANDROID_BUILD_TOOLS}" "platform-tools")
+          while read -r pkg; do [ -n "$pkg" ] && PKGS+=("$pkg"); done < /tmp/platforms37.txt
+          "$SDKMANAGER" "${PKGS[@]}"
+          ls "$ANDROID_HOME/platforms" || true
           echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_ROOT/local.properties"
 
       - name: Set up Gradle ${{ env.GRADLE_VERSION }}
