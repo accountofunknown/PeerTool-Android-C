@@ -1,0 +1,207 @@
+# PeerTool – GitHub Actions build for the exact ZIP produced alongside this file.
+#
+# Repository layout expected (both files at the repository ROOT):
+#   PeerTool-Android.zip      <- contains one top-level folder "PeerTool/" (the Gradle project)
+#   peer-tool-android.yml     <- this file; GitHub only runs workflows located in .github/workflows/
+#
+# GitHub ONLY runs workflows stored in ".github/workflows/". If you upload this file to the repository root,
+# the first job step below can't run. Upload it as ".github/workflows/peer-tool-android.yml"
+# (in the GitHub mobile web UI: Add file > Create new file, type ".github/workflows/peer-tool-android.yml" as the name,
+# paste the content) -- see README inside the ZIP for the 1-minute phone steps.
+name: PeerTool Android Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "PeerTool-Android.zip"
+      - ".github/workflows/peer-tool-android.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peertool-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIP_NAME: PeerTool-Android.zip
+  EXTRACT_DIR: peertool-src
+  EXPECTED_PROJECT_DIR: PeerTool
+  GRADLE_VERSION: "9.6.0"
+  ANDROID_PLATFORM: "android-36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  APPLICATION_ID: creator.peer.tool
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate and extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -la
+          if [ ! -f "$ZIP_NAME" ]; then
+            echo "::error title=ZIP missing::$ZIP_NAME was not found at the repository root. Upload it next to the repo's top-level files."
+            exit 1
+          fi
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q "$ZIP_NAME" -d "$EXTRACT_DIR"
+
+          # Deterministic layout first: <EXTRACT_DIR>/PeerTool/settings.gradle.kts
+          ROOT=""
+          if [ -f "$EXTRACT_DIR/$EXPECTED_PROJECT_DIR/settings.gradle.kts" ]; then
+            ROOT="$EXTRACT_DIR/$EXPECTED_PROJECT_DIR"
+          else
+            # Fallback discovery (fails loudly if ambiguous)
+            mapfile -t FOUND < <(find "$EXTRACT_DIR" -maxdepth 3 -name settings.gradle.kts -printf '%h\n')
+            if [ "${#FOUND[@]}" -ne 1 ]; then
+              echo "::error title=Ambiguous project root::Expected exactly one settings.gradle.kts, found ${#FOUND[@]}:"
+              printf '  %s\n' "${FOUND[@]:-<none>}"
+              find "$EXTRACT_DIR" -maxdepth 3 | head -80
+              exit 1
+            fi
+            ROOT="${FOUND[0]}"
+          fi
+
+          for f in settings.gradle.kts build.gradle.kts gradle/libs.versions.toml gradle/wrapper/gradle-wrapper.properties \
+                   app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            if [ ! -f "$ROOT/$f" ]; then
+              echo "::error title=Incomplete project::Missing $ROOT/$f"
+              exit 1
+            fi
+          done
+          if ! grep -q 'applicationId = "creator.peer.tool"' "$ROOT/app/build.gradle.kts"; then
+            echo "::error title=Wrong application ID::app/build.gradle.kts does not declare creator.peer.tool"
+            exit 1
+          fi
+          echo "PROJECT_ROOT=$GITHUB_WORKSPACE/$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $GITHUB_WORKSPACE/$ROOT"
+          find "$ROOT" -maxdepth 2 -not -path '*/.git/*' | sort | head -60
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "::error title=sdkmanager not found::$SDKMANAGER"
+            ls -la "$ANDROID_HOME" || true
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" "platform-tools"
+          echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_ROOT/local.properties"
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Generate Gradle Wrapper (the ZIP ships the wrapper properties only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp -d)"
+          touch "$TMP/settings.gradle"
+          (cd "$TMP" && gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin --no-daemon)
+          cp "$TMP/gradlew" "$TMP/gradlew.bat" "$PROJECT_ROOT/"
+          mkdir -p "$PROJECT_ROOT/gradle/wrapper"
+          cp "$TMP/gradle/wrapper/gradle-wrapper.jar" "$TMP/gradle/wrapper/gradle-wrapper.properties" "$PROJECT_ROOT/gradle/wrapper/"
+          chmod +x "$PROJECT_ROOT/gradlew"
+          cd "$PROJECT_ROOT"
+          ./gradlew --version
+
+      - name: Build debug APK
+        id: apk
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Run unit tests
+        id: tests
+        if: ${{ always() }}
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Run Android lint (informational, does not block the APK)
+        id: lint
+        if: ${{ always() }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: ./gradlew --no-daemon :app:lintDebug
+
+      - name: Verify APK and package ID, then package artifacts
+        id: package
+        if: ${{ always() && steps.apk.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -s "$APK" ]; then
+            echo "::error title=APK missing::$APK was not produced"
+            find app/build/outputs -type f | head -50 || true
+            exit 1
+          fi
+          AAPT2="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          BADGING="$("$AAPT2" dump badging "$APK")"
+          echo "$BADGING" | head -5
+          echo "$BADGING" | grep -q "package: name='${APPLICATION_ID}'" || {
+            echo "::error title=Wrong package::APK package is not ${APPLICATION_ID}"; exit 1; }
+          mkdir -p dist
+          cp "$APK" dist/PeerTool-debug.apk
+          (cd dist && sha256sum PeerTool-debug.apk > PeerTool-debug.apk.sha256)
+          {
+            echo "PeerTool debug build"
+            echo "Package: ${APPLICATION_ID}"
+            echo "Commit:  ${GITHUB_SHA}"
+            echo "Built:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Tests:   ${{ steps.tests.outcome }}"
+            echo "Lint:    ${{ steps.lint.outcome }} (informational)"
+            echo "SHA-256: $(cut -d' ' -f1 dist/PeerTool-debug.apk.sha256)"
+            echo "This is a DEBUG-signed APK, not a production release."
+          } > dist/BUILD-SUMMARY.txt
+          cat dist/BUILD-SUMMARY.txt
+
+      - name: Upload APK artifact
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PeerTool-debug-APK
+          path: |
+            ${{ env.PROJECT_ROOT }}/dist/PeerTool-debug.apk
+            ${{ env.PROJECT_ROOT }}/dist/PeerTool-debug.apk.sha256
+            ${{ env.PROJECT_ROOT }}/dist/BUILD-SUMMARY.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test and lint reports
+        if: ${{ always() && env.PROJECT_ROOT != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PeerTool-reports
+          path: |
+            ${{ env.PROJECT_ROOT }}/app/build/reports/tests/
+            ${{ env.PROJECT_ROOT }}/app/build/test-results/
+            ${{ env.PROJECT_ROOT }}/app/build/reports/lint-results-debug.html
+            ${{ env.PROJECT_ROOT }}/app/build/reports/lint-results-debug.xml
+          if-no-files-found: ignore
+          retention-days: 14
